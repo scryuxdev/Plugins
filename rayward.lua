@@ -1,15 +1,26 @@
 -- ============================================================
--- rayward.lua - VAC Plugin "Rayward Intel" v1.0
+-- rayward.lua - VAC Plugin "Rayward Intel" v1.1
 -- (carga: return function(api) ... end - formato del cargador del core)
 --
 -- Inteligencia de cuentas 100% OPT-IN (se activa en la tab PLUGINS):
+--   * ALTO RIESGO : fichada por Exploit Watcher (inyecciones severas
+--                   registradas; requiere API key EW_: vac> rayward key <k>)
+--   * REVISAR     : edad replicada no coincide con la fuente oficial
+--                   (users.roblox.com) o cuenta marcada baneada — dato
+--                   para el operador, NO prueba de nada
 --   * NUEVA       : AccountAge < 30 dias (dato replicado - 0 HTTP)
---   * COMPRADA?   : cuenta > 365 dias con senales de recompra (badges
---                   publicos mas nuevos que la historia de la cuenta)
---                   - solo se sondea a cuentas candidatas (rate limit)
---   * ALTO RIESGO : fichada por Exploit Watcher (robloxwatcher.com,
---                   requiere API key: vac> rayward key <tu_key>)
 --   * LIMPIA      : nada de lo anterior
+--
+-- v1.1 (auto-mejora ronda #94): los 4 endpoints adivinados de la v1.0
+--   se sustituyen por el ESQUEMA REAL documentado (OpenAPI v1.4.0):
+--     GET https://api.robloxwatcher.com/api/v1/exploitwatcher/roblox/search/{robloxId}
+--     auth: header X-API-Key (o Bearer) · key con prefijo EW_
+--     resp: { flagged, totalInjections, totalGamesInjected,
+--             injectedGames[{name,lastInjection}], discordAccounts[{id,flagged}] }
+--   Y el CAMBIO DE PRIVACIDAD de Roblox (23-03-2026): el endpoint publico
+--   de badges exige auth ahora (401) -> la heuristica "badge antiguo en
+--   cuenta vieja" murio y "sin badges" ya NO es senal (privacidad
+--   normal). Politica CERO FP: nada inventado, solo la fuente oficial.
 --
 -- Politica CERO falsos positivos: NUNCA suma score ni auto-acusa.
 -- Pinta la pestana Rayward y avisa UNA vez por jugador; el operador
@@ -22,23 +33,16 @@
 return function(api)
     local CFG = {
         NEW_DAYS = 30,        -- < 30 d  -> cuenta nueva/desechable
-        OLD_DAYS = 365,       -- > 365 d -> candidata a recompra (PGed)
+        OLD_DAYS = 365,       -- > 365 d -> candidata a verificacion
         RATE     = 2,         -- segundos entre peticiones HTTP (cola FIFO)
         BACKOFF  = 10,        -- espera extra tras un 429
         QUEUE_MAX = 60,       -- tope de cola (salas enormes: se recorta)
     }
-    -- Endpoint de Exploit Watcher: se APRENDE el primero que responde
-    -- (la doc publica lista /api/v1/exploitwatcher/search; el parametro
-    -- exacto puede variar). Autenticacion: se envian AMBOS headers y el
-    -- servidor usa el que reconozca.
-    local EP_CANDIDATES = {
-        "https://api.robloxwatcher.com/api/v1/exploitwatcher/search?userId=%d",
-        "https://robloxwatcher.com/api/v1/exploitwatcher/search?userId=%d",
-        "https://api.robloxwatcher.com/api/v1/exploitwatcher/search?robloxId=%d",
-        "https://api.robloxwatcher.com/api/v1/robloxwatcher/search?userId=%d",
-    }
-    local RBX_BADGES = "https://badges.roblox.com/v1/users/%d/badges?limit=10&sortOrder=Asc"
-    local RBX_GROUPS = "https://groups.roblox.com/v2/users/%d/groups/roles"
+    -- v1.1: endpoints UNICOS, tal cual el esquema OpenAPI oficial
+    -- (api.robloxwatcher.com, produccion; auth por header). users.roblox.com
+    -- ya estaba en la ACL del core y sigue publico (verificado in vivo).
+    local EP_WATCHER = "https://api.robloxwatcher.com/api/v1/exploitwatcher/roblox/search/%d"
+    local RBX_USER   = "https://users.roblox.com/v1/users/%d"
 
     local cache      = {}   -- [userId] = { pending=true } | resultado final
     local alerted    = {}   -- [userId] = true (UNA alerta por sesion)
@@ -46,7 +50,6 @@ return function(api)
     local lastReq    = 0    -- api.clock() de la ultima peticion HTTP
     local lastStamp  = (api.raywardStamp and api.raywardStamp()) or 0
     local key, keyAt = nil, -1e9
-    local epIdx      = 0    -- endpoint aprendido (0 = sin aprender)
     local keyBad     = false
 
     -- key: la lee del SU archivo (ACL vac_plug_rayward_*); refresco cada
@@ -79,35 +82,31 @@ return function(api)
         return math.floor((os.time() - t) / 86400)
     end
 
-    -- recorre la respuesta del watcher buscando servidores de Discord
-    -- flaggeados y el rol del usuario en cada uno (tolerante a cambios)
-    local function extractWatch(j)
-        local out = {}
-        local function walk(t, depth)
-            if type(t) ~= "table" or depth > 5 then return end
-            for _, v in pairs(t) do
-                if type(v) == "table" then
-                    local nm = v.name or v.server_name or v.guild_name
-                        or v.server or v.guild or v.discord
-                    local rl = v.role or v.roles or v.user_role
-                    if type(nm) == "string" and #nm > 0 and #nm < 128 then
-                        local role = ""
-                        if type(rl) == "string" then role = rl
-                        elseif type(rl) == "table" and #rl > 0 then
-                            local rp = {}
-                            for _, r in ipairs(rl) do
-                                rp[#rp + 1] = (type(r) == "string") and r
-                                    or (type(r) == "table" and tostring(r.name) or nil) or ""
-                            end
-                            role = table.concat(rp, ",")
-                        end
-                        out[#out + 1] = { name = nm, role = role }
-                    end
-                    walk(v, depth + 1)
+    -- v1.1: parse del ESQUEMA DOCUMENTADO de Exploit Watcher (tolerante a
+    -- campos ausentes; nada se inventa: si el campo no viene, no se usa).
+    local function parseWatch(j)
+        if type(j) ~= "table" then return nil end
+        local out = { flagged = (j.flagged == true),
+                      inj = tonumber(j.totalInjections) or 0,
+                      games = tonumber(j.totalGamesInjected) or 0,
+                      names = {}, discs = {} }
+        if type(j.injectedGames) == "table" then
+            for _, g in ipairs(j.injectedGames) do
+                if type(g) == "table" and type(g.name) == "string"
+                   and #g.name > 0 and #out.names < 2 then
+                    local last = isoDays(tostring(g.lastInjection or ""))
+                    out.names[#out.names + 1] = g.name
+                        .. ((last and last > 0) and (" (hace " .. last .. "d)") or "")
                 end
             end
         end
-        walk(j, 1)
+        if type(j.discordAccounts) == "table" then
+            for _, da in ipairs(j.discordAccounts) do
+                if type(da) == "table" and da.flagged == true and #out.discs < 2 then
+                    out.discs[#out.discs + 1] = tostring(da.id or "")
+                end
+            end
+        end
         return out
     end
 
@@ -118,79 +117,67 @@ return function(api)
         return jdec(body)
     end
 
-    -- analisis completo de UN jugador (1-3 peticiones, ya rate-limitadas)
+    -- analisis completo de UN jugador (1-2 peticiones, ya rate-limitadas)
     local function analyze(uid, info)
         local age = tonumber(info.accountAge) or 0
         local res = { name = info.name, status = "LIMPIA", reason = "",
                       age = age, watch = false }
 
-        -- 1) EXPLOIT WATCHER (solo con key)
+        -- 1) EXPLOIT WATCHER (solo con key; endpoint documentado unico)
         if key then
-            local hdr = { ["x-api-key"] = key, ["Authorization"] = "Bearer " .. key }
-            local body, code
-            local first = (epIdx > 0) and epIdx or 1
-            local okB, b, c = pcall(api.raywardFetch,
-                string.format(EP_CANDIDATES[first], uid), "GET", hdr, nil)
-            if okB then body, code = b, c end
+            local hdr = { ["X-API-Key"] = key, ["Authorization"] = "Bearer " .. key }
+            local okB, body, code = pcall(api.raywardFetch,
+                string.format(EP_WATCHER, uid), "GET", hdr, nil)
             lastReq = api.clock()
-            if not body and epIdx == 0 then
-                for i = 2, #EP_CANDIDATES do
-                    local okB2, b2, c2 = pcall(api.raywardFetch,
-                        string.format(EP_CANDIDATES[i], uid), "GET", hdr, nil)
-                    if okB2 and b2 then body, code, epIdx = b2, c2, i break end
-                end
-            end
-            if body then
-                local j = jdec(body)
-                local dw = j and extractWatch(j) or nil
-                if dw and #dw > 0 then
+            if okB and type(body) == "string" then
+                local w = parseWatch(jdec(body))
+                if w and w.flagged then
                     res.watch = true
                     res.status = "ALTO RIESGO"
-                    local parts = {}
-                    for i = 1, math.min(2, #dw) do
-                        parts[#parts + 1] = dw[i].name
-                            .. ((dw[i].role ~= "") and (" (" .. dw[i].role .. ")") or "")
+                    local det = ("inyecto %d vez/veces en %d juego(s)"):format(w.inj, w.games)
+                    if #w.names > 0 then
+                        det = det .. " (" .. table.concat(w.names, ", ") .. ")"
                     end
-                    res.reason = "Exploit Watcher: " .. table.concat(parts, " * ")
+                    if #w.discs > 0 then det = det .. " - discord ligado fichado" end
+                    res.reason = "Exploit Watcher: " .. det
+                    local dl = {}
+                    for _, did in ipairs(w.discs) do
+                        dl[#dl + 1] = { name = "Discord " .. did, role = "ligado fichado" }
+                    end
+                    if #dl > 0 then res.discords = dl end
+                elseif w and (w.inj > 0 or w.games > 0) then
+                    -- historial presente pero sin flag severo: dato, no senal
+                    res.reason = ("historial del watcher: %d inyeccion(es) registradas, sin flag severo")
+                        :format(w.inj)
                 end
             elseif code == 401 or code == 403 then
                 if not keyBad then
                     keyBad = true
                     pcall(api.log, "rayward",
-                        "API key rechazada (401/403) - revisala: vac> rayward key <tu_key>")
+                        "API key rechazada (401/403) - las keys Exploit Watcher empiezan por EW_: revisala: vac> rayward key <tu_key>")
                 end
             elseif code == 429 then
                 lastReq = api.clock() + CFG.BACKOFF   -- backoff suave
             end
         end
 
-        -- 2) SONDEO PGED (solo cuentas > OLD_DAYS - cuida el rate limit)
+        -- 2) VERIFICACION DE CUENTA (solo candidatas > OLD_DAYS):
+        --    users.roblox.com es la fuente oficial y sigue publica.
+        --    (los badges publicos murieron con la privacidad 2026-03:
+        --    NO se inventan senales debiles — politica cero FP)
         if res.status == "LIMPIA" and age >= CFG.OLD_DAYS then
-            local signals, why = 0, {}
-            local bj = fetchJSON(string.format(RBX_BADGES, uid))
-            if bj and type(bj.data) == "table" then
-                local oldest
-                for _, b in ipairs(bj.data) do
-                    local d = isoDays(b.created)
-                    if d and (not oldest or d < oldest) then oldest = d end
+            local uj = fetchJSON(string.format(RBX_USER, uid))
+            if uj and type(uj.created) == "string" then
+                local rd = isoDays(uj.created)
+                if rd and rd > 0 and math.abs(rd - age) > 45 then
+                    res.status = "REVISAR"
+                    res.reason = ("edad replicada %dd, fuente oficial %dd - no coinciden")
+                        :format(age, rd)
                 end
-                if oldest == nil then
-                    signals = signals + 1
-                    why[#why + 1] = "sin badges publicos"
-                elseif oldest < 90 then
-                    signals = signals + 2
-                    why[#why + 1] = ("badge mas antiguo de hace %dd en cuenta de %dd")
-                        :format(oldest, age)
+                if uj.isBanned == true and res.status == "LIMPIA" then
+                    res.status = "REVISAR"
+                    res.reason = "cuenta marcada baneada en users.roblox.com"
                 end
-            end
-            local gj = fetchJSON(string.format(RBX_GROUPS, uid))
-            if gj and type(gj.data) == "table" and #gj.data == 0 then
-                signals = signals + 1
-                why[#why + 1] = "sin grupos"
-            end
-            if signals >= 2 then
-                res.status = "COMPRADA?"
-                res.reason = "posible recompra: " .. table.concat(why, " + ")
             end
         end
 
@@ -255,11 +242,11 @@ return function(api)
             if okA and type(res) == "table" then
                 cache[uid] = res
                 pcall(api.setRaywardResult, uid, res)
-                if (res.status == "ALTO RIESGO" or res.status == "COMPRADA?")
+                if (res.status == "ALTO RIESGO" or res.status == "REVISAR")
                    and not alerted[uid] then
                     alerted[uid] = true
                     pcall(api.log, "rayward", string.format(
-                        "ALERTA %s (#%d): %s (%dd) - %s",
+                        "AVISO %s (#%d): %s (%dd) - %s",
                         tostring(inf.name), uid, res.status,
                         tonumber(inf.accountAge) or 0,
                         res.reason ~= "" and res.reason or "sin detalle"))
@@ -274,8 +261,8 @@ return function(api)
 
     api.register({
         name = "rayward",
-        version = "1.0",
-        desc = "Detector de cuentas nuevas, compradas (PGed) y reputacion Exploit Watcher",
+        version = "1.1",
+        desc = "Intel de cuentas: nuevas, fichadas por Exploit Watcher (API real v1.4) y verificacion users.roblox.com",
         interval = 5,     -- ciclo de escaneo cada 5 s cuando esta ON
         override = true,  -- sustituye al stub registrado por el core
         run = run,
